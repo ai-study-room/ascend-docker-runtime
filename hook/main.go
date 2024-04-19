@@ -16,26 +16,34 @@
 package main
 
 import (
+	"github.com/containerd/containerd/oci"
+	securejoin "github.com/cyphar/filepath-securejoin"
+	"github.com/opencontainers/runc/libcontainer/utils"
+	"golang.org/x/sys/unix"
+
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
-	"os"
-	"path"
-	"path/filepath"
-	"strings"
-	"syscall"
-
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"huawei.com/npu-exporter/v5/common-utils/hwlog"
+	"io/ioutil"
+	"log"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 
 	"mindxcheckutils"
 )
 
 const (
-	loggingPrefix          = "ascend-docker-hook"
-	runLogPath             = "/var/log/ascend-docker-runtime/hook-run.log"
+	loggingPrefix          = "Ascend-kata-hook"
+	runLogPath             = "/tmp/hook-run.log"
 	ascendRuntimeOptions   = "ASCEND_RUNTIME_OPTIONS"
 	ascendRuntimeMounts    = "ASCEND_RUNTIME_MOUNTS"
 	ascendVisibleDevices   = "ASCEND_VISIBLE_DEVICES"
@@ -329,6 +337,30 @@ func doPrestartHook() error {
 		return nil
 	}
 
+	if err := mountDeviceManager(containerConfig.Rootfs, containerConfig.Pid); err != nil {
+		return err
+	}
+
+	dev_files, err := ioutil.ReadDir("/dev")
+	if err != nil {
+		hwlog.RunLog.Errorf("Ascend-kata-hook: get /dev/ error %v", err)
+		return err
+	}
+
+	for _, dev_file := range dev_files {
+		if strings.Contains(dev_file.Name(), "davinci") {
+			if dev_file.Name() == "davinci_manager" {
+				continue
+			}
+			err := mountDevice(containerConfig.Rootfs, dev_file.Name(), containerConfig.Pid)
+			if err != nil {
+				return err
+			}
+
+		}
+		hwlog.RunLog.Infof("Ascend-kata-hook: get dev file %v", dev_file.Name())
+	}
+
 	mountConfigs := parseMounts(getValueByKey(containerConfig.Env, ascendRuntimeMounts))
 
 	fileMountList, dirMountList, err := readConfigsOfDir(configDir, mountConfigs)
@@ -348,7 +380,7 @@ func doPrestartHook() error {
 
 	currentExecPath, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("cannot get the path of ascend-docker-hook: %#v", err)
+		return fmt.Errorf("cannot get the path of Ascend-kata-hook: %#v", err)
 	}
 
 	cliPath := path.Join(path.Dir(currentExecPath), ascendDockerCliName)
@@ -362,7 +394,6 @@ func doPrestartHook() error {
 	if len(parsedOptions) > 0 {
 		args = append(args, "--options", strings.Join(parsedOptions, ","))
 	}
-	hwlog.RunLog.Info("ascend docker hook success, will start cli")
 	if err := mindxcheckutils.ChangeRuntimeLogMode("hook-run-"); err != nil {
 		return err
 	}
@@ -403,4 +434,122 @@ func main() {
 		hwlog.RunLog.Errorf("%v ascend docker hook failed: %#v", logPrefixWords, err)
 		log.Fatal(fmt.Errorf("failed in runtime.doProcess: %#v", err))
 	}
+}
+
+// createDeviceNode creates the file under /dev in container.
+// firstly try to mknod the device.
+// bind mount will be executed when mknod in error
+func createDeviceNode(rootfs string, dev string, pid int) error {
+	device, err := oci.DeviceFromPath(dev)
+	if err != nil {
+		return err
+	}
+	dest, err := securejoin.SecureJoin(rootfs, device.Path)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+
+	if err := mknodDevice(rootfs, *device, pid); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil
+		} else if errors.Is(err, os.ErrPermission) {
+			hwlog.RunLog.Infof("Ascend-kata-hook: mknodDevice failed with err:%v bindmount instead", err)
+			return bindMountDeviceNode(rootfs, dest, *device)
+		}
+		return err
+	}
+	return nil
+}
+
+// mknodDevice create the dev file descripter via mknod
+// as the hook process is under different  mnt namespace from container process
+// mknod should be run via nsenter
+// e.g. the container init process pid is 128, the command is:
+//      nsenter --target 128 --mount mknod /dev/davinci_manager c 245 0
+// other more, the hook executes before chroot, the dev location
+// must be the full path of rootfs
+func mknodDevice(dest string, device specs.LinuxDevice, pid int) error {
+	if device.Type != "c" {
+		return fmt.Errorf("Do not support to mount device type: %s", device.Type)
+	}
+
+	//make sure all binaries are under PATH.
+	if err := os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"); err != nil {
+		hwlog.RunLog.Errorf("set env err:%v", err)
+		return err
+	}
+
+	cmd := exec.Command("nsenter",
+		"--target",
+		strconv.Itoa(pid),
+		"--mount",
+		"mknod",
+		dest,
+		device.Type,
+		strconv.FormatInt(device.Major, 10),
+		strconv.FormatInt(device.Minor, 10),
+	)
+	output, errs := cmd.CombinedOutput()
+	if errs != nil {
+		hwlog.RunLog.Errorf("Ascend-kata-hook: exec cmd: %s, err: %s ", cmd.String(), output)
+		return fmt.Errorf("Ascend-kata-hook: Mknod err: %v", errs)
+	}
+	return nil
+}
+
+//bindMountDeviceNode create the rootfs/dev/XX via bind mount the host path
+func bindMountDeviceNode(rootfs string, dest string, device specs.LinuxDevice) error {
+	f, err := os.Create(dest)
+	if err != nil && !os.IsExist(err) {
+		return err
+	}
+	if f != nil {
+		_ = f.Close()
+	}
+	return utils.WithProcfd(rootfs, dest, func(dstFd string) error {
+		if dstFd != "" {
+			dest = dstFd
+		}
+		unix.Mount(device.Path, dest, "bind", unix.MS_BIND, "")
+		return nil
+	})
+}
+
+// mountDeviceManger creates the 910b manager relative device.
+// notes: only be tested on 910b chip currently.
+// which include davinci_manager, hisi_hdc, devmm_svm
+// Args:
+//    rootfs(string): target container's rootfs path.
+//    pid(int): target container's init process id
+func mountDeviceManager(rootfs string, pid int) error {
+	dev_names := []string{"davinci_manager", "hisi_hdc", "devmm_svm"}
+
+	for _, d := range dev_names {
+		hwlog.RunLog.Infof("Ascend-kata-hook: mount dev manager %s with rootfs %s", d, rootfs)
+		if err := mountDevice(rootfs, d, pid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mountDevice create the dev file describer for a device
+// Args:
+//     rootfs(string): target container's rootfs path
+//     dev(string): the full path of device in container
+//     pid(int): target container's init process id
+func mountDevice(rootfs string, dev string, pid int) error {
+	devfile := path.Join("/dev", dev)
+	if _, err := os.Stat(devfile); err != nil {
+		hwlog.RunLog.Errorf("Dev %s doesn't exist on host", devfile)
+		return fmt.Errorf("Npu device manager file %s doesn't exist on host", devfile)
+	}
+	if err := createDeviceNode(rootfs, devfile, pid); err != nil {
+		return err
+	}
+	return nil
 }
