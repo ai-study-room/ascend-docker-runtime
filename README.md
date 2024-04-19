@@ -1,8 +1,14 @@
-# Ascend Docker Runtime.zh
+# Ascend Kata Hook
+-  **[项目介绍](#项目介绍)
 -  **[组件介绍](#组件介绍)**
 -  **[编译Ascend-Docker-Runtime](#编译Ascend-Docker-Runtime)**
 -  **[组件安装](#组件安装)**
 -  **[更新日志](#更新日志)**
+
+# 项目介绍
+该项目fork自[Ascend docker runtime](https://github.com/Ascend/ascend-docker-runtime), 原项目设计以runtime的方式加载NPU卡，为更好支持kata runtime，进行了如下改造：
+1. 去除runtime，保留了hook与cli
+2. 将NPU设备挂在功能移植到hook中实现
 
 # 组件介绍
 容器引擎插件（Ascend Docker，又叫昇腾容器）是CANN的基础组件，为所有的AI训练/推理作业提供Ascend NPU（昇腾处理器）容器化支持，使用户AI作业能够以Docker容器的方式平滑运行在昇腾设备之上，如图1-1所示。
