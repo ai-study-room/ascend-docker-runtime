@@ -337,28 +337,12 @@ func doPrestartHook() error {
 		return nil
 	}
 
-	if err := mountDeviceManager(containerConfig.Rootfs, containerConfig.Pid); err != nil {
+	if err := setEnv(*containerConfig); err != nil {
 		return err
 	}
 
-	dev_files, err := ioutil.ReadDir("/dev")
-	if err != nil {
-		hwlog.RunLog.Errorf("Ascend-kata-hook: get /dev/ error %v", err)
+	if err := mountDev(*containerConfig); err != nil {
 		return err
-	}
-
-	for _, dev_file := range dev_files {
-		if strings.Contains(dev_file.Name(), "davinci") {
-			if dev_file.Name() == "davinci_manager" {
-				continue
-			}
-			err := mountDevice(containerConfig.Rootfs, dev_file.Name(), containerConfig.Pid)
-			if err != nil {
-				return err
-			}
-
-		}
-		hwlog.RunLog.Infof("Ascend-kata-hook: get dev file %v", dev_file.Name())
 	}
 
 	mountConfigs := parseMounts(getValueByKey(containerConfig.Env, ascendRuntimeMounts))
@@ -453,7 +437,7 @@ func createDeviceNode(rootfs string, dev string, pid int) error {
 		return err
 	}
 
-	if err := mknodDevice(rootfs, *device, pid); err != nil {
+	if err := mknodDeviceNode(dest, *device, pid); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return nil
 		} else if errors.Is(err, os.ErrPermission) {
@@ -472,7 +456,7 @@ func createDeviceNode(rootfs string, dev string, pid int) error {
 //      nsenter --target 128 --mount mknod /dev/davinci_manager c 245 0
 // other more, the hook executes before chroot, the dev location
 // must be the full path of rootfs
-func mknodDevice(dest string, device specs.LinuxDevice, pid int) error {
+func mknodDeviceNode(dest string, device specs.LinuxDevice, pid int) error {
 	if device.Type != "c" {
 		return fmt.Errorf("Do not support to mount device type: %s", device.Type)
 	}
@@ -551,5 +535,51 @@ func mountDevice(rootfs string, dev string, pid int) error {
 	if err := createDeviceNode(rootfs, devfile, pid); err != nil {
 		return err
 	}
+	return nil
+}
+
+// mountDev create the following devs under the rootfs/dev
+//    1)davinci_manager
+//    2)hisi_hdc
+//    3)devmm_svm
+//    4 all the davinci dev like davinci1,davinci2
+func mountDev(config containerConfig) error {
+
+	if err := mountDeviceManager(config.Rootfs, config.Pid); err != nil {
+		return err
+	}
+
+	dev_files, err := ioutil.ReadDir("/dev")
+	if err != nil {
+		hwlog.RunLog.Errorf("Ascend-kata-hook: get /dev/ error %v", err)
+		return err
+	}
+
+	for _, dev_file := range dev_files {
+		if strings.Contains(dev_file.Name(), "davinci") {
+			if dev_file.Name() == "davinci_manager" {
+				continue
+			}
+			err := mountDevice(config.Rootfs, dev_file.Name(), config.Pid)
+			if err != nil {
+				return err
+			}
+
+		}
+		hwlog.RunLog.Infof("Ascend-kata-hook: get dev file %v", dev_file.Name())
+	}
+	return nil
+}
+
+//setEnv export the ascend driver's libs
+func setEnv(config containerConfig) error {
+	env_file := path.Join(config.Rootfs, "/root/.bashrc")
+	f, err := os.OpenFile(env_file, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0660)
+	if err != nil {
+		hwlog.RunLog.Errorf("Ascend-kata-hook: Cannot open evn file %s, err: %v\n", env_file, err)
+		return err
+	}
+	defer f.Close()
+	f.WriteString("export LD_LIBRARY_PATH=/usr/local/Ascend/driver/include/:/usr/local/Ascend/driver/lib64/:/usr/local/dcmi/:/usr/local/Ascend/driver/lib64/common/:/usr/local/Ascend/driver/lib64/driver/")
 	return nil
 }
