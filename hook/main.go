@@ -37,6 +37,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"mindxcheckutils"
 )
@@ -340,7 +341,6 @@ func doPrestartHook() error {
 	if err := setEnv(*containerConfig); err != nil {
 		return err
 	}
-
 	if err := mountDev(*containerConfig); err != nil {
 		return err
 	}
@@ -420,6 +420,30 @@ func main() {
 	}
 }
 
+//check if rootfs exist or not
+func hasRootfs(rootfs string, pid int) bool {
+
+	if err := os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"); err != nil {
+		hwlog.RunLog.Errorf("set env err:%v", err)
+	}
+
+	cmd := exec.Command("nsenter",
+		"--target",
+		strconv.Itoa(pid),
+		"--mount",
+		"ls",
+		"-l",
+		rootfs,
+	)
+	output, errs := cmd.CombinedOutput()
+	if errs != nil {
+		hwlog.RunLog.Errorf("Ascend-kata-hook: exec cmd: %s, err: %s ", cmd.String(), output)
+		return false
+	}
+	hwlog.RunLog.Infof("Ascend-kata-hook: hasRootfs ture, return: %s", output)
+	return true
+}
+
 // createDeviceNode creates the file under /dev in container.
 // firstly try to mknod the device.
 // bind mount will be executed when mknod in error
@@ -428,10 +452,21 @@ func createDeviceNode(rootfs string, dev string, pid int) error {
 	if err != nil {
 		return err
 	}
-	dest, err := securejoin.SecureJoin(rootfs, device.Path)
-	if err != nil {
-		return err
+
+	//check the rootfs path to verify whether the container is up
+	//container is in creating when rootfs exists. should mknod under rootfs.
+	//container is running when rootfs doesn't exists. should mknod dev directly
+	dest := device.Path
+	if hr := hasRootfs(rootfs, pid); hr {
+		dest, err = securejoin.SecureJoin(rootfs, device.Path)
+
+		if err != nil {
+			return err
+		}
+		hwlog.RunLog.Infof("Ascend-kata-hook: rootfs exists, dest is: %s", dest)
+
 	}
+	hwlog.RunLog.Infof("Ascend-kata-hook: ----dest----: %s", dest)
 
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
@@ -548,25 +583,41 @@ func mountDev(config containerConfig) error {
 	if err := mountDeviceManager(config.Rootfs, config.Pid); err != nil {
 		return err
 	}
-
-	dev_files, err := ioutil.ReadDir("/dev")
-	if err != nil {
-		hwlog.RunLog.Errorf("Ascend-kata-hook: get /dev/ error %v", err)
-		return err
-	}
-
-	for _, dev_file := range dev_files {
-		if strings.Contains(dev_file.Name(), "davinci") {
-			if dev_file.Name() == "davinci_manager" {
-				continue
-			}
-			err := mountDevice(config.Rootfs, dev_file.Name(), config.Pid)
-			if err != nil {
-				return err
-			}
-
+	WAIT_TOTAL_SECONDS, CHECK_PERIOD := 45, 3
+	start := time.Now()
+	has_dev := false
+	for {
+		dev_files, err := ioutil.ReadDir("/dev")
+		if err != nil {
+			hwlog.RunLog.Errorf("Ascend-kata-hook: get /dev/ error %v", err)
+			return err
 		}
-		hwlog.RunLog.Infof("Ascend-kata-hook: get dev file %v", dev_file.Name())
+
+		for _, dev_file := range dev_files {
+			if strings.Contains(dev_file.Name(), "davinci") {
+				if dev_file.Name() == "davinci_manager" {
+					continue
+				}
+				has_dev = true
+				err := mountDevice(config.Rootfs, dev_file.Name(), config.Pid)
+				if err != nil {
+					hwlog.RunLog.Errorf("Ascend-kata-hook: mountDevice:%s, error: %v", dev_file.Name(), err)
+					return err
+				}
+			}
+			hwlog.RunLog.Infof("Ascend-kata-hook: get dev file %v", dev_file.Name())
+		}
+
+		//wait the dev ready
+		delta := time.Now().Sub(start)
+		if has_dev || delta > time.Duration(WAIT_TOTAL_SECONDS)*time.Second {
+			break
+		}
+		time.Sleep(time.Duration(CHECK_PERIOD) * time.Second)
+
+	}
+	if !has_dev {
+		return fmt.Errorf("Ascend-kata-hook: timeout to find /dev/davinci*")
 	}
 	return nil
 }
@@ -580,6 +631,6 @@ func setEnv(config containerConfig) error {
 		return err
 	}
 	defer f.Close()
-	f.WriteString("export LD_LIBRARY_PATH=/usr/local/Ascend/driver/include/:/usr/local/Ascend/driver/lib64/:/usr/local/dcmi/:/usr/local/Ascend/driver/lib64/common/:/usr/local/Ascend/driver/lib64/driver/")
+	f.WriteString("export LD_LIBRARY_PATH=/usr/local/dcmi/:/usr/local/Ascend/driver/lib64/common/:/usr/local/Ascend/driver/lib64/driver/")
 	return nil
 }
