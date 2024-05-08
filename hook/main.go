@@ -335,9 +335,11 @@ func doPrestartHook() error {
 	}
 
 	if visibleDevices := getValueByKey(containerConfig.Env, ascendVisibleDevices); visibleDevices == "" {
+		hwlog.RunLog.Infof("Ascend-kata-hook: hasn’t ascend device: %#v",ascendVisibleDevices)
 		return nil
 	}
 
+	hwlog.RunLog.Infof("Ascend-kata-hook: has ascend device define: %#v",ascendVisibleDevices)
 	if err := setEnv(*containerConfig); err != nil {
 		return err
 	}
@@ -381,9 +383,11 @@ func doPrestartHook() error {
 	if err := mindxcheckutils.ChangeRuntimeLogMode("hook-run-"); err != nil {
 		return err
 	}
+	hwlog.RunLog.Infof("Ascend-kata-hook: start to exec cli, cliPath:%s, args:%v, Environ: %v", cliPath, args, os.Environ())
 	if err := doExec(cliPath, args, os.Environ()); err != nil {
 		return fmt.Errorf("failed to exec ascend-docker-cli %v: %v", args, err)
 	}
+	hwlog.RunLog.Infof("Ascend-kata-hook: start to mountDev: %v", *containerConfig)
 	return nil
 }
 
@@ -420,8 +424,8 @@ func main() {
 	}
 }
 
-//check if rootfs exist or not
-func hasRootfs(rootfs string, pid int) bool {
+//check if file exist or not
+func hasFile(file string, pid int) bool {
 
 	if err := os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"); err != nil {
 		hwlog.RunLog.Errorf("set env err:%v", err)
@@ -433,7 +437,7 @@ func hasRootfs(rootfs string, pid int) bool {
 		"--mount",
 		"ls",
 		"-l",
-		rootfs,
+		file,
 	)
 	output, errs := cmd.CombinedOutput()
 	if errs != nil {
@@ -457,7 +461,7 @@ func createDeviceNode(rootfs string, dev string, pid int) error {
 	//container is in creating when rootfs exists. should mknod under rootfs.
 	//container is running when rootfs doesn't exists. should mknod dev directly
 	dest := device.Path
-	if hr := hasRootfs(rootfs, pid); hr {
+	if hr := hasFile(rootfs, pid); hr {
 		dest, err = securejoin.SecureJoin(rootfs, device.Path)
 
 		if err != nil {
@@ -501,6 +505,12 @@ func mknodDeviceNode(dest string, device specs.LinuxDevice, pid int) error {
 		hwlog.RunLog.Errorf("set env err:%v", err)
 		return err
 	}
+
+	devExists := hasFile(dest,pid)
+	if devExists {
+		hwlog.RunLog.Warnf("Ascend-kata-hook: mknod target already exists.")
+		return nil
+	} 
 
 	cmd := exec.Command("nsenter",
 		"--target",
@@ -564,7 +574,7 @@ func mountDeviceManager(rootfs string, pid int) error {
 func mountDevice(rootfs string, dev string, pid int) error {
 	devfile := path.Join("/dev", dev)
 	if _, err := os.Stat(devfile); err != nil {
-		hwlog.RunLog.Errorf("Dev %s doesn't exist on host", devfile)
+		hwlog.RunLog.Errorf("Dev %s doesn't exist on host, err: %v", devfile,err)
 		return fmt.Errorf("Npu device manager file %s doesn't exist on host", devfile)
 	}
 	if err := createDeviceNode(rootfs, devfile, pid); err != nil {
@@ -583,7 +593,7 @@ func mountDev(config containerConfig) error {
 	if err := mountDeviceManager(config.Rootfs, config.Pid); err != nil {
 		return err
 	}
-	WAIT_TOTAL_SECONDS, CHECK_PERIOD := 45, 3
+	WAIT_TOTAL_SECONDS, CHECK_PERIOD := 60, 3
 	start := time.Now()
 	has_dev := false
 	for {
@@ -610,14 +620,14 @@ func mountDev(config containerConfig) error {
 
 		//wait the dev ready
 		delta := time.Now().Sub(start)
-		if has_dev || delta > time.Duration(WAIT_TOTAL_SECONDS)*time.Second {
+		if  delta > time.Duration(WAIT_TOTAL_SECONDS)*time.Second {
 			break
 		}
 		time.Sleep(time.Duration(CHECK_PERIOD) * time.Second)
 
 	}
 	if !has_dev {
-		return fmt.Errorf("Ascend-kata-hook: timeout to find /dev/davinci*")
+		hwlog.RunLog.Errorf("Ascend-kata-hook: timeout to find /dev/davinci*")
 	}
 	return nil
 }
