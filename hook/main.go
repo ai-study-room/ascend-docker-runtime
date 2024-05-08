@@ -335,11 +335,11 @@ func doPrestartHook() error {
 	}
 
 	if visibleDevices := getValueByKey(containerConfig.Env, ascendVisibleDevices); visibleDevices == "" {
-		hwlog.RunLog.Infof("Ascend-kata-hook: hasn’t ascend device: %#v",ascendVisibleDevices)
+		hwlog.RunLog.Infof("Ascend-kata-hook: hasn't ascend device: %#v", ascendVisibleDevices)
 		return nil
 	}
 
-	hwlog.RunLog.Infof("Ascend-kata-hook: has ascend device define: %#v",ascendVisibleDevices)
+	hwlog.RunLog.Infof("Ascend-kata-hook: has ascend device define: %#v", ascendVisibleDevices)
 	if err := setEnv(*containerConfig); err != nil {
 		return err
 	}
@@ -354,40 +354,36 @@ func doPrestartHook() error {
 		return fmt.Errorf("failed to read configuration from config directory: %#v", err)
 	}
 
-	parsedOptions, err := parseRuntimeOptions(getValueByKey(containerConfig.Env, ascendRuntimeOptions))
-	if err != nil {
-		return fmt.Errorf("failed to parse runtime options: %#v", err)
+	for _, file := range fileMountList {
+		if _, err := os.Stat(file); err != nil {
+			return fmt.Errorf("mount file %s doesn't exist on host", file)
+		}
+
+		dest, err := securejoin.SecureJoin(containerConfig.Rootfs, file)
+		if err != nil {
+			return fmt.Errorf("join file parent: %s, child: %s, with err %v", containerConfig.Rootfs, file, err)
+		}
+		err = bindMountFile(containerConfig.Rootfs, dest, file)
+		if err != nil {
+			return fmt.Errorf("bind mount file source: %s, dest: %s with err %v", file, dest, err)
+		}
 	}
 
-	allowLink, err := parseSoftLinkMode(getValueByKey(containerConfig.Env, ascendAllowLink))
-	if err != nil {
-		return fmt.Errorf("failed to parse soft link mode: %#v", err)
+	for _, dir := range dirMountList {
+		if _, err := os.Stat(dir); err != nil {
+			return fmt.Errorf("mount dir %s doesn't exist on host", dir)
+		}
+
+		dest, err := securejoin.SecureJoin(containerConfig.Rootfs, dir)
+		if err != nil {
+			return fmt.Errorf("join file parent: %s, child: %s with err %v", containerConfig.Rootfs, dir, err)
+		}
+		err = bindMountDir(containerConfig.Rootfs, dest, dir)
+		if err != nil {
+			return fmt.Errorf("bind mount dir source: %s, dest: %s with err %v", dir, dest, err)
+		}
 	}
 
-	currentExecPath, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("cannot get the path of Ascend-kata-hook: %#v", err)
-	}
-
-	cliPath := path.Join(path.Dir(currentExecPath), ascendDockerCliName)
-	if _, err = os.Stat(cliPath); err != nil {
-		return fmt.Errorf("cannot find ascend-docker-cli executable file at %s: %#v", cliPath, err)
-	}
-	if _, err := mindxcheckutils.RealFileChecker(cliPath, true, false, mindxcheckutils.DefaultSize); err != nil {
-		return err
-	}
-	args := getArgs(cliPath, containerConfig, fileMountList, dirMountList, allowLink)
-	if len(parsedOptions) > 0 {
-		args = append(args, "--options", strings.Join(parsedOptions, ","))
-	}
-	if err := mindxcheckutils.ChangeRuntimeLogMode("hook-run-"); err != nil {
-		return err
-	}
-	hwlog.RunLog.Infof("Ascend-kata-hook: start to exec cli, cliPath:%s, args:%v, Environ: %v", cliPath, args, os.Environ())
-	if err := doExec(cliPath, args, os.Environ()); err != nil {
-		return fmt.Errorf("failed to exec ascend-docker-cli %v: %v", args, err)
-	}
-	hwlog.RunLog.Infof("Ascend-kata-hook: start to mountDev: %v", *containerConfig)
 	return nil
 }
 
@@ -424,7 +420,7 @@ func main() {
 	}
 }
 
-//check if file exist or not
+// check if file exist or not
 func hasFile(file string, pid int) bool {
 
 	if err := os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"); err != nil {
@@ -492,7 +488,9 @@ func createDeviceNode(rootfs string, dev string, pid int) error {
 // as the hook process is under different  mnt namespace from container process
 // mknod should be run via nsenter
 // e.g. the container init process pid is 128, the command is:
-//      nsenter --target 128 --mount mknod /dev/davinci_manager c 245 0
+//
+//	nsenter --target 128 --mount mknod /dev/davinci_manager c 245 0
+//
 // other more, the hook executes before chroot, the dev location
 // must be the full path of rootfs
 func mknodDeviceNode(dest string, device specs.LinuxDevice, pid int) error {
@@ -506,11 +504,11 @@ func mknodDeviceNode(dest string, device specs.LinuxDevice, pid int) error {
 		return err
 	}
 
-	devExists := hasFile(dest,pid)
+	devExists := hasFile(dest, pid)
 	if devExists {
 		hwlog.RunLog.Warnf("Ascend-kata-hook: mknod target already exists.")
 		return nil
-	} 
+	}
 
 	cmd := exec.Command("nsenter",
 		"--target",
@@ -530,8 +528,14 @@ func mknodDeviceNode(dest string, device specs.LinuxDevice, pid int) error {
 	return nil
 }
 
-//bindMountDeviceNode create the rootfs/dev/XX via bind mount the host path
+// bindMountDeviceNode creates the rootfs/dev/xxx
 func bindMountDeviceNode(rootfs string, dest string, device specs.LinuxDevice) error {
+	return bindMountFile(rootfs, dest, device.Path)
+
+}
+
+// bindMountFile creates and mount file from host to container
+func bindMountFile(rootfs string, dest string, source string) error {
 	f, err := os.Create(dest)
 	if err != nil && !os.IsExist(err) {
 		return err
@@ -539,11 +543,25 @@ func bindMountDeviceNode(rootfs string, dest string, device specs.LinuxDevice) e
 	if f != nil {
 		_ = f.Close()
 	}
+	return bindMount(rootfs, dest, source)
+}
+
+// bindMountDir creates dirctory and mount dir
+func bindMountDir(rootfs string, dest string, source string) error {
+	err := os.MkdirAll(dest, 0550)
+	if err != nil {
+		return err
+	}
+	return bindMount(rootfs, dest, source)
+}
+
+// bindMount create the dest via bind mount the host path
+func bindMount(rootfs string, dest string, source string) error {
 	return utils.WithProcfd(rootfs, dest, func(dstFd string) error {
 		if dstFd != "" {
 			dest = dstFd
 		}
-		unix.Mount(device.Path, dest, "bind", unix.MS_BIND, "")
+		unix.Mount(source, dest, "bind", unix.MS_BIND, "")
 		return nil
 	})
 }
@@ -552,8 +570,9 @@ func bindMountDeviceNode(rootfs string, dest string, device specs.LinuxDevice) e
 // notes: only be tested on 910b chip currently.
 // which include davinci_manager, hisi_hdc, devmm_svm
 // Args:
-//    rootfs(string): target container's rootfs path.
-//    pid(int): target container's init process id
+//
+//	rootfs(string): target container's rootfs path.
+//	pid(int): target container's init process id
 func mountDeviceManager(rootfs string, pid int) error {
 	dev_names := []string{"davinci_manager", "hisi_hdc", "devmm_svm"}
 
@@ -568,13 +587,14 @@ func mountDeviceManager(rootfs string, pid int) error {
 
 // mountDevice create the dev file describer for a device
 // Args:
-//     rootfs(string): target container's rootfs path
-//     dev(string): the full path of device in container
-//     pid(int): target container's init process id
+//
+//	rootfs(string): target container's rootfs path
+//	dev(string): the full path of device in container
+//	pid(int): target container's init process id
 func mountDevice(rootfs string, dev string, pid int) error {
 	devfile := path.Join("/dev", dev)
 	if _, err := os.Stat(devfile); err != nil {
-		hwlog.RunLog.Errorf("Dev %s doesn't exist on host, err: %v", devfile,err)
+		hwlog.RunLog.Errorf("Dev %s doesn't exist on host, err: %v", devfile, err)
 		return fmt.Errorf("Npu device manager file %s doesn't exist on host", devfile)
 	}
 	if err := createDeviceNode(rootfs, devfile, pid); err != nil {
@@ -584,10 +604,11 @@ func mountDevice(rootfs string, dev string, pid int) error {
 }
 
 // mountDev create the following devs under the rootfs/dev
-//    1)davinci_manager
-//    2)hisi_hdc
-//    3)devmm_svm
-//    4 all the davinci dev like davinci1,davinci2
+//
+//	1)davinci_manager
+//	2)hisi_hdc
+//	3)devmm_svm
+//	4 all the davinci dev like davinci1,davinci2
 func mountDev(config containerConfig) error {
 
 	if err := mountDeviceManager(config.Rootfs, config.Pid); err != nil {
@@ -620,7 +641,7 @@ func mountDev(config containerConfig) error {
 
 		//wait the dev ready
 		delta := time.Now().Sub(start)
-		if  delta > time.Duration(WAIT_TOTAL_SECONDS)*time.Second {
+		if delta > time.Duration(WAIT_TOTAL_SECONDS)*time.Second {
 			break
 		}
 		time.Sleep(time.Duration(CHECK_PERIOD) * time.Second)
@@ -632,7 +653,7 @@ func mountDev(config containerConfig) error {
 	return nil
 }
 
-//setEnv export the ascend driver's libs
+// setEnv export the ascend driver's libs
 func setEnv(config containerConfig) error {
 	env_file := path.Join(config.Rootfs, "/root/.bashrc")
 	f, err := os.OpenFile(env_file, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0660)
