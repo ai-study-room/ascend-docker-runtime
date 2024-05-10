@@ -343,10 +343,6 @@ func doPrestartHook() error {
 	if err := setEnv(*containerConfig); err != nil {
 		return err
 	}
-	if err := mountDev(*containerConfig); err != nil {
-		return err
-	}
-
 	mountConfigs := parseMounts(getValueByKey(containerConfig.Env, ascendRuntimeMounts))
 
 	fileMountList, dirMountList, err := readConfigsOfDir(configDir, mountConfigs)
@@ -382,6 +378,10 @@ func doPrestartHook() error {
 		if err != nil {
 			return fmt.Errorf("bind mount dir source: %s, dest: %s with err %v", dir, dest, err)
 		}
+	}
+
+	if err := mountDev(*containerConfig); err != nil {
+		return err
 	}
 
 	return nil
