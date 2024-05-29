@@ -21,9 +21,10 @@ Ascend Kata Hook本质上是基于OCI标准实现的prestart hook，以插件方
 
 
 Ascend Kata Hook在prestart-hook这个钩子函数中，对容器做了以下配置操作：
-1.将guest所有的NPU设备挂载到容器的namespace。
-2.将guest上的驱动相关的文件、目录、以及设备符挂载到容器的namespace。
-3.设置相应的环境变量。
+
+* 将guest所有的NPU设备挂载到容器的namespace。
+* 将guest上的驱动相关的文件、目录、以及设备符挂载到容器的namespace。
+* 设置相应的环境变量。
 
 # 编译Ascend-kata-hook
 执行以下步骤进行编译
@@ -44,17 +45,18 @@ go build -buildmode=pie -trimpath -o ./out/ascend-kata-hook ./hook/main.go
 ```
 
 将编译后的组件：
+
 - ascend-kata-hook
+
 确保文件具备执行权限后放置到kata guest镜像的/usr/share/oci/hooks/pre-hook/目录下
 详情参见[kata镜像制作](https://ai-study-room.github.io/docs/kata-npu/get-started/build/)
 
 修改kata配置文件 
-···shell
+
+```shell
 vim /etc/kata-containers/configuration.toml
-```
 
 增加如下配置项
-···
 guest_hook_path=/usr/share/oci/hooks/
 ```
 
